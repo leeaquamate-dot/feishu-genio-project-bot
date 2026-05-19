@@ -1,0 +1,23 @@
+name = "feishu-bot"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+ENVIRONMENT = "production"
+# Admin open IDs (comma-separated in production)
+ADMIN_OPEN_IDS = "ou_ae2cb272fa06dc9651b8d0007de6112e,ou_c874a571d1dfb219b982c1a177f9702f"
+
+# KV namespace for config and user cache
+[[kv_namespaces]]
+binding = "KV"
+id = "YOUR_KV_NAMESPACE_ID"
+
+# D1 database for backups
+[[d1_databases]]
+binding = "DB"
+database_name = "feishu-bot-backups"
+database_id = "YOUR_D1_DATABASE_ID"
+
+# Cron trigger: 09:00 Beijing time (01:00 UTC), weekdays only
+[triggers]
+crons = ["0 1 * * 1-5"]

@@ -1,0 +1,6 @@
+# Development variables (copy to .dev.vars for local development)
+# These are placeholders - set real values in Cloudflare dashboard
+
+FEISHU_APP_ID=your_app_id
+FEISHU_APP_SECRET=your_app_secret
+DEEPSEEK_API_KEY=your_deepseek_api_key
