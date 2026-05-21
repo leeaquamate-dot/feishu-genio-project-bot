@@ -50,7 +50,7 @@ export function parseEndDate(endValue: any): Date | null {
 
   // Timestamp in milliseconds
   if (typeof endValue === 'number') {
-    return new Date(endValue / 1000);
+    return new Date(endValue);
   }
 
   // String date format
@@ -126,7 +126,7 @@ export function buildAdminRiskEntry(
   today: Date,
   doneStatuses: string[]
 ): { displayName: string; days: number; riskDesc: string; ownerNames: string; summaryLine: string; cardLine: string } | null {
-  if (!taskName || !owners || !endValue || statusMatches(status, doneStatuses)) return null;
+  if (!taskName || !owners || owners.length === 0 || !endValue || statusMatches(status, doneStatuses)) return null;
 
   const displayName = buildDisplayName(taskName, phaseName);
 

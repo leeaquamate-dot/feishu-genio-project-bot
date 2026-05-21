@@ -1,10 +1,10 @@
-import { Env, BitableRecord } from './types';
-import { sendCardMessage } from './feishu/message';
-import { fetchAllRecords, buildBitableUrl } from './feishu/bitable';
-import { getProjects, saveUsers, getUsers } from './storage/kv';
-import { saveBackup, logHistory } from './storage/d1';
-import { callDeepSeek } from './services/ai';
-import { DEFAULT_CONFIG, buildDailyTodoTask, buildAdminRiskEntry, statusMatches } from './utils/task-rules';
+import { Env, BitableRecord } from '../types';
+import { sendCardMessage } from '../feishu/message';
+import { fetchAllRecords, buildBitableUrl } from '../feishu/bitable';
+import { getProjects, saveUsers, getUsers } from '../storage/kv';
+import { saveBackup, logHistory } from '../storage/d1';
+import { callDeepSeek } from './ai';
+import { DEFAULT_CONFIG, buildDailyTodoTask, buildAdminRiskEntry, statusMatches } from '../utils/task-rules';
 
 function getAdminIds(env: Env): string[] {
   return env.ADMIN_OPEN_IDS.split(',').map(s => s.trim()).filter(Boolean);
@@ -32,97 +32,52 @@ export async function runInspection(env: Env): Promise<void> {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  // Global data collection
-  const allRisksForAdmin: string[] = [];
+  const results = await Promise.all(
+    projects.map(proj =>
+      processProjectForInspection(env, proj, today).catch(error => {
+        console.error(`❌ 处理项目 ${proj.name} 失败:`, error);
+        return null;
+      })
+    )
+  );
+
+  // Merge results
   const globalUserTasks: Map<string, string[]> = new Map();
+  const allRisksForAdmin: string[] = [];
   const adminRiskDetails: string[] = [];
+  const allNewUsers: Record<string, string> = {};
 
-  for (const proj of projects) {
-    console.log(`📂 扫描项目: ${proj.name}...`);
+  for (const result of results) {
+    if (!result) continue;
+    Object.assign(allNewUsers, result.newUsers);
 
-    try {
-      const records = await fetchAllRecords(env, proj.token, proj.table);
+    for (const [uid, tasks] of result.userTasks) {
+      if (!globalUserTasks.has(uid)) globalUserTasks.set(uid, []);
+      globalUserTasks.get(uid)!.push(tasks);
+    }
 
-      if (records.length === 0) {
-        console.log(`⚠️ 项目 ${proj.name} 为空或读取失败。`);
-        continue;
-      }
-
-      // Backup
-      await saveBackup(env, proj.token, proj.name, records);
-
-      // Process records
-      const projUserMap: Map<string, string[]> = new Map();
-      const allProjMembers = new Set<string>();
-      const projRisks: string[] = [];
-
-      for (const record of records) {
-        const fields = record.fields;
-        const taskVal = fields[DEFAULT_CONFIG.colTaskKey] || '';
-        const phaseCn = fields[DEFAULT_CONFIG.colPhaseKey] || '';
-        const owners = fields[DEFAULT_CONFIG.colOwner] as Array<{ id: string; name?: string }> | undefined;
-        const status = fields[DEFAULT_CONFIG.colStatus] || '';
-        const endValue = fields[DEFAULT_CONFIG.colEnd];
-
-        // A. Engineer daily todos
-        const dailyTask = buildDailyTodoTask(
-          taskVal, phaseCn, status, endValue, today, DEFAULT_CONFIG.dailyTodoStatusList
-        );
-
-        if (dailyTask && owners) {
-          // Save user names
-          const newUsers: Record<string, string> = {};
-          for (const p of owners) {
-            if (p.name) newUsers[p.id] = p.name;
-            allProjMembers.add(p.id);
-          }
-          await saveUsers(env, newUsers);
-
-          for (const p of owners) {
-            const uid = p.id;
-            if (!projUserMap.has(uid)) projUserMap.set(uid, []);
-            projUserMap.get(uid)!.push(dailyTask.line);
-          }
-        }
-
-        // B. Admin risk collection
-        const riskEntry = buildAdminRiskEntry(
-          proj.name, taskVal, phaseCn, owners || null, status, endValue, today, DEFAULT_CONFIG.doneList
-        );
-
-        if (riskEntry) {
-          allRisksForAdmin.push(riskEntry.summaryLine);
-          projRisks.push(riskEntry.cardLine);
-        }
-      }
-
-      // Aggregate to global
-      const projUrl = buildBitableUrl(proj.token, proj.table);
-      const projHeader = `📁 **[${proj.name}](${projUrl})**`;
-
-      for (const [uid, tasks] of projUserMap) {
-        if (!globalUserTasks.has(uid)) globalUserTasks.set(uid, []);
-        const section = `${projHeader}\n${tasks.join('\n')}`;
-        globalUserTasks.get(uid)!.push(section);
-      }
-
-      if (projRisks.length > 0) {
-        const section = `${projHeader}\n${projRisks.join('\n')}`;
-        adminRiskDetails.push(section);
-      }
-    } catch (error) {
-      console.error(`❌ 处理项目 ${proj.name} 失败:`, error);
+    allRisksForAdmin.push(...result.adminRiskSummaries);
+    if (result.adminRiskDetail) {
+      adminRiskDetails.push(result.adminRiskDetail);
     }
   }
 
-  // Send notifications
+  if (Object.keys(allNewUsers).length > 0) {
+    await saveUsers(env, allNewUsers);
+  }
+
+  // Send notifications in parallel by recipient type
+  const sendTasks: Promise<any>[] = [];
+
   // A. Send to engineers
   for (const [uid, sections] of globalUserTasks) {
     const totalTasks = sections.reduce((sum, s) => sum + (s.match(/\n>/g) || []).length, 0);
     const content = sections.join('\n\n---\n\n');
     const color = content.includes('🔴') || content.includes('🟠') ? 'red' : 'blue';
-    await sendCardMessage(env, uid, `📋 每日待办 (${totalTasks}个)`, content, undefined, color);
-    console.log(`   ✅ 已通知负责人: ${uid}`);
+    sendTasks.push(
+      sendCardMessage(env, uid, `📋 每日待办 (${totalTasks}个)`, content, undefined, color)
+        .then(() => console.log(`   ✅ 已通知负责人: ${uid}`))
+    );
   }
 
   // B. Send to admins
@@ -133,19 +88,18 @@ export async function runInspection(env: Env): Promise<void> {
   } else if (allRisksForAdmin.length > 0) {
     console.log('🤖 发现风险，正在请求 DeepSeek 生成简报...');
 
-    // 1. Risk details card
     const detailContent = adminRiskDetails.join('\n\n---\n\n');
-    for (const adminId of adminIds) {
-      await sendCardMessage(env, adminId, '📋 每日风险详情', detailContent, undefined, 'red');
-    }
-
-    // 2. AI summary card
     const summaryText = allRisksForAdmin.join('\n');
     const aiReport = await callDeepSeek(env, summaryText, projects.length);
 
     for (const adminId of adminIds) {
-      await sendCardMessage(env, adminId, '📊 项目风险晨报 (AI)', aiReport, undefined, 'purple');
-      console.log(`   ✅ 已汇报给管理员(风险): ${adminId}`);
+      sendTasks.push(
+        sendCardMessage(env, adminId, '📋 每日风险详情', detailContent, undefined, 'red')
+      );
+      sendTasks.push(
+        sendCardMessage(env, adminId, '📊 项目风险晨报 (AI)', aiReport, undefined, 'purple')
+          .then(() => console.log(`   ✅ 已汇报给管理员(风险): ${adminId}`))
+      );
     }
   } else {
     console.log('🎉 一切正常，正在发送平安报...');
@@ -156,13 +110,89 @@ export async function runInspection(env: Env): Promise<void> {
 ✨ 状态：一切正常，请管理员放心！`;
 
     for (const adminId of adminIds) {
-      await sendCardMessage(env, adminId, '🟢 每日巡检简报', normalReport, undefined, 'green');
-      console.log(`   ✅ 已汇报给管理员(正常): ${adminId}`);
+      sendTasks.push(
+        sendCardMessage(env, adminId, '🟢 每日巡检简报', normalReport, undefined, 'green')
+          .then(() => console.log(`   ✅ 已汇报给管理员(正常): ${adminId}`))
+      );
     }
   }
 
+  await Promise.all(sendTasks);
+
   console.log('✅ 巡检结束。');
   await logHistory(env, 'inspection', '✅ **自动巡检结束**');
+}
+
+async function processProjectForInspection(
+  env: Env,
+  proj: { token: string; table: string; name: string },
+  today: Date
+): Promise<{
+  userTasks: Map<string, string>;
+  adminRiskSummaries: string[];
+  adminRiskDetail: string | null;
+  newUsers: Record<string, string>;
+} | null> {
+  console.log(`📂 扫描项目: ${proj.name}...`);
+
+  const records = await fetchAllRecords(env, proj.token, proj.table);
+  if (records.length === 0) {
+    console.log(`⚠️ 项目 ${proj.name} 为空或读取失败。`);
+    return null;
+  }
+
+  await saveBackup(env, proj.token, proj.name, records);
+
+  const projUserMap: Map<string, string[]> = new Map();
+  const projRisks: string[] = [];
+  const adminRiskSummaries: string[] = [];
+  const newUsers: Record<string, string> = {};
+
+  for (const record of records) {
+    const fields = record.fields;
+    const taskVal = fields[DEFAULT_CONFIG.colTaskKey] || '';
+    const phaseCn = fields[DEFAULT_CONFIG.colPhaseKey] || '';
+    const owners = fields[DEFAULT_CONFIG.colOwner] as Array<{ id: string; name?: string }> | undefined;
+    const status = fields[DEFAULT_CONFIG.colStatus] || '';
+    const endValue = fields[DEFAULT_CONFIG.colEnd];
+
+    const dailyTask = buildDailyTodoTask(
+      taskVal, phaseCn, status, endValue, today, DEFAULT_CONFIG.dailyTodoStatusList
+    );
+
+    if (dailyTask && owners) {
+      for (const p of owners) {
+        if (p.name) newUsers[p.id] = p.name;
+        const uid = p.id;
+        if (!projUserMap.has(uid)) projUserMap.set(uid, []);
+        projUserMap.get(uid)!.push(dailyTask.line);
+      }
+    }
+
+    const riskEntry = buildAdminRiskEntry(
+      proj.name, taskVal, phaseCn, owners || null, status, endValue, today, DEFAULT_CONFIG.doneList
+    );
+
+    if (riskEntry) {
+      adminRiskSummaries.push(riskEntry.summaryLine);
+      projRisks.push(riskEntry.cardLine);
+    }
+  }
+
+  const projUrl = buildBitableUrl(proj.token, proj.table);
+  const projHeader = `📁 **[${proj.name}](${projUrl})**`;
+
+  const userTasks = new Map<string, string>();
+  for (const [uid, tasks] of projUserMap) {
+    userTasks.set(uid, `${projHeader}\n${tasks.join('\n')}`);
+  }
+
+  return {
+    userTasks,
+    adminRiskSummaries,
+    adminRiskDetail: projRisks.length > 0 ? `${projHeader}\n${projRisks.join('\n')}` : null,
+    newUsers
+  };
 }
 
 export async function generateSummary(env: Env, userId: string): Promise<void> {
@@ -182,51 +212,30 @@ export async function generateSummary(env: Env, userId: string): Promise<void> {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
+  const results = await Promise.all(
+    projects.map(proj =>
+      processProjectForSummary(env, proj, today).catch(error => {
+        console.error(`❌ 处理项目 ${proj.name} 失败:`, error);
+        return null;
+      })
+    )
+  );
+
   const allRisks: string[] = [];
   const detailedSections: string[] = [];
+  const allNewUsers: Record<string, string> = {};
 
-  for (const proj of projects) {
-    try {
-      const records = await fetchAllRecords(env, proj.token, proj.table);
-      if (records.length === 0) continue;
-
-      const projRisksMd: string[] = [];
-
-      for (const record of records) {
-        const fields = record.fields;
-        const taskVal = fields[DEFAULT_CONFIG.colTaskKey] || '';
-        const phaseCn = fields[DEFAULT_CONFIG.colPhaseKey] || '';
-        const owners = fields[DEFAULT_CONFIG.colOwner] as Array<{ id: string; name?: string }> | undefined;
-        const status = fields[DEFAULT_CONFIG.colStatus] || '';
-        const endValue = fields[DEFAULT_CONFIG.colEnd];
-
-        // Save user names
-        if (owners) {
-          const newUsers: Record<string, string> = {};
-          for (const p of owners) {
-            if (p.name) newUsers[p.id] = p.name;
-          }
-          await saveUsers(env, newUsers);
-        }
-
-        const riskEntry = buildAdminRiskEntry(
-          proj.name, taskVal, phaseCn, owners || null, status, endValue, today, DEFAULT_CONFIG.doneList
-        );
-
-        if (riskEntry) {
-          allRisks.push(riskEntry.summaryLine);
-          projRisksMd.push(riskEntry.cardLine);
-        }
-      }
-
-      if (projRisksMd.length > 0) {
-        const url = buildBitableUrl(proj.token, proj.table);
-        const header = `📁 **[${proj.name}](${url})**`;
-        detailedSections.push(`${header}\n${projRisksMd.join('\n')}`);
-      }
-    } catch (error) {
-      console.error(`❌ 处理项目 ${proj.name} 失败:`, error);
+  for (const result of results) {
+    if (!result) continue;
+    Object.assign(allNewUsers, result.newUsers);
+    allRisks.push(...result.summaryLines);
+    if (result.detailSection) {
+      detailedSections.push(result.detailSection);
     }
+  }
+
+  if (Object.keys(allNewUsers).length > 0) {
+    await saveUsers(env, allNewUsers);
   }
 
   let title: string;
@@ -247,9 +256,61 @@ export async function generateSummary(env: Env, userId: string): Promise<void> {
   }
 
   if (loadingMsgId) {
-    const { updateCardMessage } = await import('./feishu/message');
+    const { updateCardMessage } = await import('../feishu/message');
     await updateCardMessage(env, loadingMsgId, title, content, undefined, color);
   } else {
     await sendCardMessage(env, userId, title, content, undefined, color);
   }
+}
+
+async function processProjectForSummary(
+  env: Env,
+  proj: { token: string; table: string; name: string },
+  today: Date
+): Promise<{
+  summaryLines: string[];
+  detailSection: string | null;
+  newUsers: Record<string, string>;
+} | null> {
+  const records = await fetchAllRecords(env, proj.token, proj.table);
+  if (records.length === 0) return null;
+
+  const projRisksMd: string[] = [];
+  const summaryLines: string[] = [];
+  const newUsers: Record<string, string> = {};
+
+  for (const record of records) {
+    const fields = record.fields;
+    const owners = fields[DEFAULT_CONFIG.colOwner] as Array<{ id: string; name?: string }> | undefined;
+
+    if (owners) {
+      for (const p of owners) {
+        if (p.name) newUsers[p.id] = p.name;
+      }
+    }
+
+    const riskEntry = buildAdminRiskEntry(
+      proj.name,
+      fields[DEFAULT_CONFIG.colTaskKey] || '',
+      fields[DEFAULT_CONFIG.colPhaseKey] || '',
+      owners || null,
+      fields[DEFAULT_CONFIG.colStatus] || '',
+      fields[DEFAULT_CONFIG.colEnd],
+      today,
+      DEFAULT_CONFIG.doneList
+    );
+
+    if (riskEntry) {
+      summaryLines.push(riskEntry.summaryLine);
+      projRisksMd.push(riskEntry.cardLine);
+    }
+  }
+
+  let detailSection: string | null = null;
+  if (projRisksMd.length > 0) {
+    const url = buildBitableUrl(proj.token, proj.table);
+    detailSection = `📁 **[${proj.name}](${url})**\n${projRisksMd.join('\n')}`;
+  }
+
+  return { summaryLines, detailSection, newUsers };
 }

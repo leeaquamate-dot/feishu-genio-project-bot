@@ -19,7 +19,7 @@ export async function createGroup(
     // Filter out owner from members list
     const membersToAdd = memberIds.filter(id => id !== ownerId);
 
-    const result = await feishuPost<CreateChatResult>(env, '/im/v1/chats', {
+    const result = await feishuPost<CreateChatResult>(env, '/im/v1/chats?user_id_type=open_id', {
       name,
       owner_id: ownerId,
       user_id_list: membersToAdd
@@ -41,7 +41,7 @@ export async function addGroupMembers(
   try {
     const result = await feishuPost<AddMembersResult>(
       env,
-      `/im/v1/chats/${chatId}/members`,
+      `/im/v1/chats/${chatId}/members?member_id_type=open_id`,
       { id_list: memberIds }
     );
 

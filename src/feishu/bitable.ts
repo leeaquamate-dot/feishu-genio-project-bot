@@ -5,6 +5,7 @@ export interface BitableRecordListResponse {
   items: BitableRecord[];
   has_more: boolean;
   page_token?: string;
+  total: number;
 }
 
 export interface BitableAppResponse {
@@ -14,28 +15,38 @@ export interface BitableAppResponse {
   };
 }
 
+const PAGE_SIZE = 500;
+
 export async function fetchAllRecords(
   env: Env,
   appToken: string,
   tableId: string
 ): Promise<BitableRecord[]> {
-  const allRecords: BitableRecord[] = [];
-  let pageToken: string | undefined;
+  const firstPage = await feishuGet<BitableRecordListResponse>(
+    env,
+    `/bitable/v1/apps/${appToken}/tables/${tableId}/records?page_size=${PAGE_SIZE}`
+  );
 
-  do {
-    let path = `/bitable/v1/apps/${appToken}/tables/${tableId}/records?page_size=100`;
-    if (pageToken) {
-      path += `&page_token=${pageToken}`;
-    }
+  if (!firstPage.has_more) {
+    return firstPage.items ?? [];
+  }
 
-    const data = await feishuGet<BitableRecordListResponse>(env, path);
+  // Collect remaining pages serially (cursor pagination requires it)
+  const allRecords = [...(firstPage.items ?? [])];
+  let pageToken = firstPage.page_token;
+
+  while (pageToken) {
+    const data = await feishuGet<BitableRecordListResponse>(
+      env,
+      `/bitable/v1/apps/${appToken}/tables/${tableId}/records?page_size=${PAGE_SIZE}&page_token=${pageToken}`
+    );
 
     if (data.items) {
       allRecords.push(...data.items);
     }
 
     pageToken = data.has_more ? data.page_token : undefined;
-  } while (pageToken);
+  }
 
   return allRecords;
 }

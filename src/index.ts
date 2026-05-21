@@ -15,9 +15,16 @@ export default {
       });
     }
 
-    // Webhook endpoint
-    if (url.pathname === '/webhook' && request.method === 'POST') {
-      return handleWebhook(request, env);
+    // Webhook endpoint - accept both GET (for testing) and POST
+    if (url.pathname === '/webhook') {
+      if (request.method === 'GET') {
+        return new Response('Webhook endpoint ready. POST events here.', {
+          headers: { 'Content-Type': 'text/plain' }
+        });
+      }
+      if (request.method === 'POST') {
+        return handleWebhook(request, env, ctx);
+      }
     }
 
     // Manual trigger endpoint (for testing)

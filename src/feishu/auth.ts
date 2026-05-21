@@ -1,6 +1,6 @@
 import { Env, FeishuTokenResponse } from '../types';
 
-const FEISHU_API_BASE = 'https://open.feishu.cn/open-api';
+const FEISHU_API_BASE = 'https://open.feishu.cn/open-apis';
 
 // Token cache with TTL
 let cachedToken: string | null = null;

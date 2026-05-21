@@ -1,7 +1,7 @@
 import { Env, CardMessage } from '../types';
 import { feishuPost } from './auth';
 
-const FEISHU_API_BASE = 'https://open.feishu.cn/open-api';
+const FEISHU_API_BASE = 'https://open.feishu.cn/open-apis';
 
 export interface SendMessageResult {
   message_id: string;
@@ -68,8 +68,7 @@ export async function sendCardMessage(
   const card = buildCard(title, content, url, color);
 
   try {
-    const result = await feishuPost<SendMessageResult>(env, '/im/v1/messages', {
-      receive_id_type: 'open_id',
+    const result = await feishuPost<SendMessageResult>(env, '/im/v1/messages?receive_id_type=open_id', {
       receive_id: userId,
       msg_type: 'interactive',
       content: JSON.stringify(card)

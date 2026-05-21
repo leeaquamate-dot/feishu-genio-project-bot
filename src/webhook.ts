@@ -22,22 +22,36 @@ function getAdminIds(env: Env): string[] {
   return env.ADMIN_OPEN_IDS.split(',').map(s => s.trim()).filter(Boolean);
 }
 
-export async function handleWebhook(request: Request, env: Env): Promise<Response> {
-  // Parse event
-  const event: FeishuMessageEvent = await request.json();
+// Feishu URL verification handler
+function handleUrlVerification(body: any): Response {
+  // Feishu sends a challenge for URL verification
+  if (body.type === 'url_verification' && body.challenge) {
+    console.log('URL verification challenge received');
+    return new Response(JSON.stringify({ challenge: body.challenge }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  return new Response('Invalid verification request', { status: 400 });
+}
 
-  // Validate event
-  if (!event.header?.event_id || !event.event?.message) {
-    return new Response('Invalid event', { status: 400 });
+export async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await request.json();
+
+  if (body.type === 'url_verification') {
+    return handleUrlVerification(body);
   }
 
-  // Deduplication
+  const event: FeishuMessageEvent = body;
+
+  if (!event.header?.event_id || !event.event?.message) {
+    return new Response('OK'); // Non-message events (e.g., chat entered), acknowledge silently
+  }
+
   if (await isMessageProcessed(env, event.header.event_id)) {
     return new Response('OK');
   }
   await markMessageProcessed(env, event.header.event_id);
 
-  // Only handle message receive events
   if (event.header.event_type !== 'im.message.receive_v1') {
     return new Response('OK');
   }
@@ -50,7 +64,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
 
   try {
     // Handle commands
-    await dispatchCommand(env, senderId, text, messageContent.text);
+    await dispatchCommand(env, senderId, text, messageContent.text, ctx);
   } catch (error) {
     console.error('Command handling error:', error);
     await sendCardMessage(env, senderId, '❌ 错误', String(error), undefined, 'red');
@@ -59,7 +73,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   return new Response('OK');
 }
 
-async function dispatchCommand(env: Env, senderId: string, textLower: string, originalText: string): Promise<void> {
+async function dispatchCommand(env: Env, senderId: string, textLower: string, originalText: string, ctx: ExecutionContext): Promise<void> {
   // Help
   if (['help', '帮助', '指令', '?', 'command'].includes(textLower)) {
     await sendHelp(env, senderId);
@@ -87,8 +101,7 @@ async function dispatchCommand(env: Env, senderId: string, textLower: string, or
   // Run inspection
   if (['立即巡检', 'run', 'inspect', 'check'].includes(textLower)) {
     await sendCardMessage(env, senderId, '🚀 收到指令', '后台正在巡检中...', undefined, 'blue');
-    // Run in background (fire and forget in Workers)
-    await runInspection(env);
+    ctx.waitUntil(runInspection(env));
     return;
   }
 
@@ -146,22 +159,24 @@ async function dispatchCommand(env: Env, senderId: string, textLower: string, or
 }
 
 async function sendHelp(env: Env, userId: string): Promise<void> {
-  const helpText = `**📋 Pro Bot Commands / 指令列表：**
+  const helpText = `**📌 项目管理**
+- \`建群\` / \`create groups\` — 一键为所有项目建群
+- \`建群 1\` / \`group 1\` — 为指定序号的项目建群
+- \`监控\`+链接 / \`add\`+URL — 添加监控项目
+- \`停止 1\` / \`stop 1\` — 移除监控项目
+- \`列表\` / \`list\` — 查看所有已监控项目
 
-| 中文指令 | English | 功能/Function |
-|---|---|---|
-| \`建群\` | \`create groups\` | **一键建群** / Create Group |
-| \`建群\`+序号 | \`group\`+N | 指定建群 / Create for Proj |
-| \`我的任务\` | \`tasks\` | 查看待办 / My Todos |
-| \`项目汇总\` | \`summary\` | 风险汇报 / Risk Report |
-| \`列表\` | \`list\` | 监控列表 / Project List |
-| \`停止 1\` | \`stop 1\` | 移除项目 / Remove Proj |
-| \`查ID\` | \`id\` | 查看ID / View ID |
-| \`立即巡检\` | \`run\` | 立即检查(全员广播) / Run Check |
-| \`监控\`+链接 | \`add\`+URL | 添加项目 / Add Proj |
-| \`下线\` | \`off\` | **通知并关机** / Shutdown |
+**📋 任务与汇报**
+- \`我的任务\` / \`tasks\` — 查看我的待办任务
+- \`项目汇总\` / \`summary\` — 风险汇总报告
+- \`立即巡检\` / \`run\` — 立即巡检（全员广播）
 
-💡 **Auto:** Daily 09:00 AM`;
+**🔧 其他**
+- \`查ID\` / \`id\` — 查看用户 Open ID
+- \`帮助\` / \`help\` — 显示本菜单
+- \`下线\` / \`shutdown\` — 关闭机器人（管理员）
+
+💡 每日 **09:00** 自动巡检并推送风险日报`;
 
   await sendCardMessage(env, userId, '🤖 机器人帮助 | Help', helpText, undefined, 'blue');
 }
@@ -228,52 +243,30 @@ async function sendMyTasks(env: Env, userId: string): Promise<void> {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
+  const results = await Promise.all(
+    projects.map(proj =>
+      processProjectForUser(env, proj, userId, today).catch(error => {
+        console.error(`Failed to process project ${proj.name}:`, error);
+        return null;
+      })
+    )
+  );
+
   const allTasks: string[] = [];
   let totalTasks = 0;
+  const allNewUsers: Record<string, string> = {};
 
-  for (const proj of projects) {
-    try {
-      const records = await fetchAllRecords(env, proj.token, proj.table);
-      const projTasks: string[] = [];
-
-      for (const record of records) {
-        const fields = record.fields;
-        const owners = fields[DEFAULT_CONFIG.colOwner] as Array<{ id: string; name?: string }> | undefined;
-
-        if (!owners) continue;
-
-        const ownerIds = owners.map(o => o.id);
-        if (!ownerIds.includes(userId)) continue;
-
-        // Save user names
-        const newUsers: Record<string, string> = {};
-        for (const o of owners) {
-          if (o.name) newUsers[o.id] = o.name;
-        }
-        await saveUsers(env, newUsers);
-
-        const taskName = fields[DEFAULT_CONFIG.colTaskKey] || '';
-        const phaseName = fields[DEFAULT_CONFIG.colPhaseKey] || '';
-        const status = fields[DEFAULT_CONFIG.colStatus] || '';
-        const endValue = fields[DEFAULT_CONFIG.colEnd];
-
-        if (!taskName || statusMatches(status, DEFAULT_CONFIG.doneList)) continue;
-
-        const taskLine = buildMyTaskLine(taskName, phaseName, status, endValue, today);
-        if (taskLine) {
-          projTasks.push(taskLine);
-        }
-      }
-
-      if (projTasks.length > 0) {
-        const url = buildBitableUrl(proj.token, proj.table);
-        const header = `📁 **[${proj.name}](${url})**`;
-        allTasks.push(`${header}\n${projTasks.join('\n')}`);
-        totalTasks += projTasks.length;
-      }
-    } catch (error) {
-      console.error(`Failed to process project ${proj.name}:`, error);
+  for (const result of results) {
+    if (!result) continue;
+    Object.assign(allNewUsers, result.newUsers);
+    if (result.tasks.length > 0) {
+      allTasks.push(result.tasks);
+      totalTasks += result.taskCount;
     }
+  }
+
+  if (Object.keys(allNewUsers).length > 0) {
+    await saveUsers(env, allNewUsers);
   }
 
   let title: string;
@@ -295,6 +288,51 @@ async function sendMyTasks(env: Env, userId: string): Promise<void> {
   } else {
     await sendCardMessage(env, userId, title, content, undefined, color);
   }
+}
+
+async function processProjectForUser(
+  env: Env,
+  proj: Project,
+  userId: string,
+  today: Date
+): Promise<{ tasks: string; taskCount: number; newUsers: Record<string, string> } | null> {
+  const records = await fetchAllRecords(env, proj.token, proj.table);
+  const projTasks: string[] = [];
+  const newUsers: Record<string, string> = {};
+
+  for (const record of records) {
+    const fields = record.fields;
+    const owners = fields[DEFAULT_CONFIG.colOwner] as Array<{ id: string; name?: string }> | undefined;
+    if (!owners) continue;
+
+    const ownerIds = owners.map(o => o.id);
+    if (!ownerIds.includes(userId)) continue;
+
+    for (const o of owners) {
+      if (o.name) newUsers[o.id] = o.name;
+    }
+
+    const taskName = fields[DEFAULT_CONFIG.colTaskKey] || '';
+    if (!taskName || statusMatches(fields[DEFAULT_CONFIG.colStatus] || '', DEFAULT_CONFIG.doneList)) continue;
+
+    const taskLine = buildMyTaskLine(
+      taskName,
+      fields[DEFAULT_CONFIG.colPhaseKey] || '',
+      fields[DEFAULT_CONFIG.colStatus] || '',
+      fields[DEFAULT_CONFIG.colEnd],
+      today
+    );
+    if (taskLine) projTasks.push(taskLine);
+  }
+
+  if (projTasks.length === 0) return { tasks: '', taskCount: 0, newUsers };
+
+  const url = buildBitableUrl(proj.token, proj.table);
+  return {
+    tasks: `📁 **[${proj.name}](${url})**\n${projTasks.join('\n')}`,
+    taskCount: projTasks.length,
+    newUsers
+  };
 }
 
 async function sendSummary(env: Env, userId: string): Promise<void> {

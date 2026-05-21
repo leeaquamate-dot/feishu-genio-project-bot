@@ -10,13 +10,13 @@ ADMIN_OPEN_IDS = "ou_ae2cb272fa06dc9651b8d0007de6112e,ou_c874a571d1dfb219b982c1a
 # KV namespace for config and user cache
 [[kv_namespaces]]
 binding = "KV"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "e973114a6d744adf8e9a0e2ad99c4b0c"
 
 # D1 database for backups
 [[d1_databases]]
 binding = "DB"
 database_name = "feishu-bot-backups"
-database_id = "YOUR_D1_DATABASE_ID"
+database_id = "7e7dfa25-d75b-4072-89c6-144f9fff6b59"
 
 # Cron trigger: 09:00 Beijing time (01:00 UTC), weekdays only
 [triggers]
